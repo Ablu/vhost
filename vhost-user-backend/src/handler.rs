@@ -13,7 +13,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 
-use crate::bitmap::{BitmapReplace, MemRegionBitmap, MmapLogReg};
+use crate::bitmap::{BitmapReplace, MmapLogReg};
 #[cfg(feature = "postcopy")]
 use userfaultfd::{Uffd, UffdBuilder};
 use vhost::vhost_user::message::{
@@ -736,20 +736,12 @@ where
                 .map_err(VhostUserError::ReqHandlerError)?,
         );
 
-        // Let's create all bitmaps first before replacing them, in case any of them fails
-        let mut bitmaps = Vec::new();
         for region in mem.iter() {
-            let bitmap = <<T as VhostUserBackend>::Bitmap as BitmapReplace>::InnerBitmap::new(
-                region,
-                Arc::clone(&logmem),
-            )
-            .map_err(VhostUserError::ReqHandlerError)?;
-
-            bitmaps.push((region, bitmap));
-        }
-
-        for (region, bitmap) in bitmaps {
-            region.bitmap().replace(bitmap);
+            // TODO: Do we need to reset logging when one fails here?
+            region
+                .bitmap()
+                .start_logging(region, Arc::clone(&logmem))
+                .map_err(VhostUserError::ReqHandlerError)?;
         }
 
         Ok(())

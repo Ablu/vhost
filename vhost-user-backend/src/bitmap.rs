@@ -19,34 +19,25 @@ const LOG_WORD_SIZE: usize = u8::BITS as usize;
 
 /// A `Bitmap` with an internal `Bitmap` that can be replaced at runtime
 pub trait BitmapReplace: Bitmap {
-    type InnerBitmap: MemRegionBitmap;
-
     /// Replace the internal `Bitmap`
-    fn replace(&self, bitmap: Self::InnerBitmap);
-}
-
-/// A bitmap relative to a memory region
-pub trait MemRegionBitmap: Sized {
-    /// Creates a new bitmap relative to `region`, using the `logmem` as
-    /// backing memory for the bitmap
-    fn new<R: GuestMemoryRegion>(region: &R, logmem: Arc<MmapLogReg>) -> io::Result<Self>;
+    fn start_logging<R: GuestMemoryRegion>(
+        &self,
+        region: &R,
+        logmem: Arc<MmapLogReg>,
+    ) -> io::Result<()>;
 }
 
 // TODO: This impl is a quick and dirty hack to allow the tests to continue using
 // `GuestMemoryMmap<()>`. Sadly this is exposed in the public API, but it should
 // be moved to an internal mock library.
 impl BitmapReplace for () {
-    type InnerBitmap = ();
-
     // this implementation must not be used if the backend sets `VHOST_USER_PROTOCOL_F_LOG_SHMFD`
-    fn replace(&self, _bitmap: ()) {
+    fn start_logging<R: GuestMemoryRegion>(
+        &self,
+        _region: &R,
+        _logmem: Arc<MmapLogReg>,
+    ) -> io::Result<()> {
         panic!("The unit bitmap () must not be used if VHOST_USER_PROTOCOL_F_LOG_SHMFD is set");
-    }
-}
-
-impl MemRegionBitmap for () {
-    fn new<R: GuestMemoryRegion>(_region: &R, _logmem: Arc<MmapLogReg>) -> io::Result<Self> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
 
@@ -63,14 +54,15 @@ impl MemRegionBitmap for () {
 /// the underlying operating system's implementation and does not guarantee any particular policy,
 /// in systems other than linux a thread trying to acquire the lock may starve.
 #[derive(Default, Debug, Clone)]
-pub struct BitmapMmapRegion {
+// TODO: Can we really make this private?
+pub(crate) struct VhostUserBackendBitmap {
     // TODO: To avoid both reader and writer starvation we can replace the `std::sync::RwLock` with
     // `parking_lot::RwLock`.
     inner: Arc<RwLock<Option<AtomicBitmapMmap>>>,
     base_address: usize, // The slice's base address
 }
 
-impl Bitmap for BitmapMmapRegion {
+impl Bitmap for VhostUserBackendBitmap {
     fn mark_dirty(&self, offset: usize, len: usize) {
         let inner = self.inner.read().unwrap();
         if let Some(bitmap) = inner.as_ref() {
@@ -95,22 +87,26 @@ impl Bitmap for BitmapMmapRegion {
     }
 }
 
-impl BitmapReplace for BitmapMmapRegion {
-    type InnerBitmap = AtomicBitmapMmap;
-
-    fn replace(&self, bitmap: AtomicBitmapMmap) {
+impl BitmapReplace for VhostUserBackendBitmap {
+    fn start_logging<R: GuestMemoryRegion>(
+        &self,
+        region: &R,
+        logmem: Arc<MmapLogReg>,
+    ) -> io::Result<()> {
+        let bitmap = AtomicBitmapMmap::new(region, logmem)?;
         let mut inner = self.inner.write().unwrap();
         inner.replace(bitmap);
+        Ok(())
     }
 }
 
-impl BitmapSlice for BitmapMmapRegion {}
+impl BitmapSlice for VhostUserBackendBitmap {}
 
-impl<'a> WithBitmapSlice<'a> for BitmapMmapRegion {
+impl<'a> WithBitmapSlice<'a> for VhostUserBackendBitmap {
     type S = Self;
 }
 
-impl NewBitmap for BitmapMmapRegion {
+impl NewBitmap for VhostUserBackendBitmap {
     fn with_len(_len: usize) -> Self {
         Self::default()
     }
@@ -122,7 +118,7 @@ impl NewBitmap for BitmapMmapRegion {
 /// specification). It uses a fixed memory page size of `LOG_PAGE_SIZE` bytes, so it converts
 /// addresses to page numbers before setting or clearing the bits.
 #[derive(Debug)]
-pub struct AtomicBitmapMmap {
+struct AtomicBitmapMmap {
     logmem: Arc<MmapLogReg>,
     pages_before_region: usize, // Number of pages to ignore from the start of the bitmap
     number_of_pages: usize,     // Number of total pages indexed in the bitmap for this region
@@ -134,7 +130,7 @@ pub struct AtomicBitmapMmap {
 // the mapped area, the memory region does not necessarily have to start at the beginning of
 // that word.
 // Note: we don't implement `Bitmap` because we cannot implement `slice_at()`
-impl MemRegionBitmap for AtomicBitmapMmap {
+impl AtomicBitmapMmap {
     // Creates a new memory-mapped bitmap for the memory region. This bitmap must fit within the
     // log mapped memory.
     fn new<R: GuestMemoryRegion>(region: &R, logmem: Arc<MmapLogReg>) -> io::Result<Self> {
@@ -166,9 +162,7 @@ impl MemRegionBitmap for AtomicBitmapMmap {
             number_of_pages: size_page,
         })
     }
-}
 
-impl AtomicBitmapMmap {
     // Sets the memory range as dirty. The `offset` is relative to the memory region,
     // so an offset of `0` references the start of the memory region. Any attempt to
     // access beyond the end of the bitmap are simply ignored.
@@ -348,7 +342,7 @@ mod tests {
         f
     }
 
-    fn test_all(b: &BitmapMmapRegion, len: usize) {
+    fn test_all(b: &VhostUserBackendBitmap, len: usize) {
         assert!(range_is_clean(b, 0, len), "The bitmap should be clean");
 
         b.mark_dirty(0, len);
@@ -394,12 +388,8 @@ mod tests {
         let logmem =
             Arc::new(MmapLogReg::from_file(f.as_fd(), mmap_offset, mmap_size as u64).unwrap());
 
-        let log = AtomicBitmapMmap::new(&region, logmem);
-        assert!(log.is_ok());
-        let log = log.unwrap();
-
-        let bitmap = BitmapMmapRegion::default();
-        bitmap.replace(log);
+        let bitmap = VhostUserBackendBitmap::default();
+        bitmap.start_logging(&region, logmem).unwrap();
 
         test_all(&bitmap, region_len);
     }
@@ -421,13 +411,9 @@ mod tests {
         let logmem =
             Arc::new(MmapLogReg::from_file(f.as_fd(), mmap_offset, mmap_size as u64).unwrap());
 
-        let log = AtomicBitmapMmap::new(&region, logmem);
-        assert!(log.is_ok());
-        let log = log.unwrap();
+        let bitmap = VhostUserBackendBitmap::default();
 
-        let bitmap = BitmapMmapRegion::default();
-
-        bitmap.replace(log);
+        bitmap.start_logging(&region, logmem).unwrap();
 
         test_all(&bitmap, region_len);
     }
@@ -449,12 +435,8 @@ mod tests {
         let logmem =
             Arc::new(MmapLogReg::from_file(f.as_fd(), mmap_offset, mmap_size as u64).unwrap());
 
-        let log = AtomicBitmapMmap::new(&region, logmem);
-        assert!(log.is_ok());
-        let log = log.unwrap();
-
-        let bitmap = BitmapMmapRegion::default();
-        bitmap.replace(log);
+        let bitmap = VhostUserBackendBitmap::default();
+        bitmap.start_logging(&region, logmem).unwrap();
 
         test_all(&bitmap, region_len);
     }
@@ -476,11 +458,10 @@ mod tests {
         let region0: GuestRegionMmap<()> =
             GuestRegionMmap::from_range(region0_start_addr, region0_len, None).unwrap();
 
-        let log0 = AtomicBitmapMmap::new(&region0, Arc::clone(&logmem));
-        assert!(log0.is_ok());
-        let log0 = log0.unwrap();
-        let bitmap0 = BitmapMmapRegion::default();
-        bitmap0.replace(log0);
+        let bitmap0 = VhostUserBackendBitmap::default();
+        bitmap0
+            .start_logging(&region0, Arc::clone(&logmem))
+            .unwrap();
 
         // A 1-page guest memory region
         let region1_start_addr = GuestAddress::new(mmap_offset + LOG_PAGE_SIZE as u64 * 14);
@@ -488,12 +469,10 @@ mod tests {
         let region1: GuestRegionMmap<()> =
             GuestRegionMmap::from_range(region1_start_addr, region1_len, None).unwrap();
 
-        let log1 = AtomicBitmapMmap::new(&region1, Arc::clone(&logmem));
-        assert!(log1.is_ok());
-        let log1 = log1.unwrap();
-
-        let bitmap1 = BitmapMmapRegion::default();
-        bitmap1.replace(log1);
+        let bitmap1 = VhostUserBackendBitmap::default();
+        bitmap1
+            .start_logging(&region1, Arc::clone(&logmem))
+            .unwrap();
 
         // Both regions should be clean
         assert!(
@@ -535,12 +514,10 @@ mod tests {
         let region0: GuestRegionMmap<()> =
             GuestRegionMmap::from_range(region0_start_addr, region0_len, None).unwrap();
 
-        let log0 = AtomicBitmapMmap::new(&region0, Arc::clone(&logmem));
-        assert!(log0.is_ok());
-        let log0 = log0.unwrap();
-
-        let bitmap0 = BitmapMmapRegion::default();
-        bitmap0.replace(log0);
+        let bitmap0 = VhostUserBackendBitmap::default();
+        bitmap0
+            .start_logging(&region0, Arc::clone(&logmem))
+            .unwrap();
 
         // A 1-page guest memory region
         let region1_start_addr = GuestAddress::new(mmap_offset + LOG_PAGE_SIZE as u64 * 14);
@@ -548,12 +525,10 @@ mod tests {
         let region1: GuestRegionMmap<()> =
             GuestRegionMmap::from_range(region1_start_addr, region1_len, None).unwrap();
 
-        let log1 = AtomicBitmapMmap::new(&region1, Arc::clone(&logmem));
-        assert!(log1.is_ok());
-        let log1 = log1.unwrap();
-
-        let bitmap1 = BitmapMmapRegion::default();
-        bitmap1.replace(log1);
+        let bitmap1 = VhostUserBackendBitmap::default();
+        bitmap1
+            .start_logging(&region1, Arc::clone(&logmem))
+            .unwrap();
 
         // Both regions should be clean
         assert!(
@@ -595,12 +570,8 @@ mod tests {
         let logmem =
             Arc::new(MmapLogReg::from_file(f.as_fd(), mmap_offset, mmap_size as u64).unwrap());
 
-        let log = AtomicBitmapMmap::new(&region, logmem);
-        assert!(log.is_ok());
-        let log = log.unwrap();
-
-        let bitmap = BitmapMmapRegion::default();
-        bitmap.replace(log);
+        let bitmap = VhostUserBackendBitmap::default();
+        bitmap.start_logging(&region, logmem).unwrap();
 
         assert!(
             range_is_clean(&bitmap, 0, region_len),
